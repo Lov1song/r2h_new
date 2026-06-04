@@ -27,7 +27,11 @@ from dataset import get_dataloaders
 PATCH_DIR   = Path(r'E:\2026\05\r2h\dataset\patches')
 CKPT_DIR    = Path(r'E:\2026\05\r2h\checkpoints\v6')
 LOG_PATH    = Path(r'E:\2026\05\r2h\checkpoints\v6\train_log.csv')
-HSI_BANDS   = 176
+# Full range: 176 bands, 402-1005 nm.
+# Default: trim UV tail (bands 0-4, 402-416nm, SRF≈0) and
+#          NIR tail (bands 160-175, 953-1005nm, sensor falloff).
+BAND_START_DEFAULT = 10    #~419 nm
+BAND_END_DEFAULT   = 160  # ~950 nm  (exclusive), 155 bands
 EPS         = 1e-3   # MRAE epsilon
 
 
@@ -159,6 +163,10 @@ def parse_args():
                    help='path to pretrained weights for backbone init (strict=False)')
     p.add_argument('--mask_thresh', type=float, default=0.05,
                    help='GT mean reflectance below this is down-weighted in loss')
+    p.add_argument('--band_start', type=int, default=BAND_START_DEFAULT,
+                   help='first band index to use (inclusive). default=5 (~419nm)')
+    p.add_argument('--band_end',   type=int, default=BAND_END_DEFAULT,
+                   help='last band index to use (exclusive). default=160 (~950nm)')
     return p.parse_args()
 
 
@@ -166,15 +174,23 @@ def main():
     args = parse_args()
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
+    band_indices = list(range(args.band_start, args.band_end))
+    hsi_bands    = len(band_indices)
+    wl_all       = np.linspace(402, 1005, 176)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
+    print(f'Band range: band {args.band_start}–{args.band_end-1} '
+          f'({wl_all[args.band_start]:.1f}–{wl_all[args.band_end-1]:.1f} nm), '
+          f'{hsi_bands} bands')
 
     train_loader, val_loader, _ = get_dataloaders(
-        PATCH_DIR, batch_size=args.batch_size, num_workers=args.num_workers)
+        PATCH_DIR, batch_size=args.batch_size, num_workers=args.num_workers,
+        band_indices=band_indices)
     print(f'Train patches: {len(train_loader.dataset)}  '
           f'Val patches: {len(val_loader.dataset)}')
 
-    model = MSTpp(in_channels=3, out_channels=HSI_BANDS,
+    model = MSTpp(in_channels=3, out_channels=hsi_bands,
                   n_feat=args.n_feat, stage=args.stage).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Model params: {total_params/1e6:.2f}M')
@@ -238,6 +254,8 @@ def main():
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'best_mrae': best_mrae,
+            'band_start': args.band_start,
+            'band_end':   args.band_end,
         }
         # save latest
         torch.save(ckpt, CKPT_DIR / 'latest.pth')
