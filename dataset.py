@@ -6,8 +6,8 @@ Each .npz patch contains:
   'hsi': (256, 256, 176) float32 [0, 1]
 
 __getitem__ returns:
-  rgb: (3, 128, 128) tensor  — network input
-  hsi: (C, 128, 128) tensor — reconstruction target (C=176 or len(band_indices))
+  rgb: (3, H, W) tensor  — network input
+  hsi: (C, H, W) tensor — reconstruction target (C=176 or len(band_indices))
 """
 
 import numpy as np

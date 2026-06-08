@@ -272,7 +272,7 @@ class MSTpp(nn.Module):
         super(MSTpp, self).__init__()
         self.stage = stage
         self.conv_in  = nn.Conv2d(in_channels, n_feat, kernel_size=3, padding=1, bias=False)
-        modules_body  = [MST(dim=n_feat, stage=2, num_blocks=[1, 1, 1]) for _ in range(stage)]
+        modules_body  = [MST(in_dim=n_feat, out_dim=n_feat, dim=n_feat, stage=2, num_blocks=[1, 1, 1]) for _ in range(stage)]
         self.body     = nn.Sequential(*modules_body)
         self.conv_out = nn.Conv2d(n_feat, out_channels, kernel_size=3, padding=1, bias=False)
         # residual projection when feature dim != output channels

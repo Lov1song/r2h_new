@@ -15,7 +15,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / 'scripts'))
 from preprocess import load_scan, calibrate, build_srf_matrix, synthesize_rgb
 
 RAW_ROOT   = Path(r'F:\蓝莓')

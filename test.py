@@ -17,14 +17,14 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
-from architecture.MSTpp import MSTpp
+from architecture import build_model
 from dataset import BlueberryHSIDataset
 
 PATCH_DIR  = Path(r'E:\2026\05\r2h\dataset\patches')
-CKPT_PATH  = Path(r'E:\2026\05\r2h\checkpoints\v2\best.pth')
+CKPT_PATH  = Path(r'E:\2026\05\r2h\checkpoints\v7\best.pth')
 VIS_DIR    = Path(r'E:\2026\05\r2h\test_vis')
 RESULTS_PATH = Path(r'E:\2026\05\r2h\test_results.npz')
-HSI_BANDS  = 176
+WL_ALL     = np.linspace(402, 1005, 176)
 EPS        = 1e-3
 
 
@@ -73,8 +73,17 @@ def false_color(hsi: np.ndarray, bands=None):
     return img
 
 
-def save_comparison(rgb, pred, gt, idx, out_dir: Path):
-    wl = np.linspace(402, 1005, pred.shape[0])  # pred: (C,H,W)
+def sam(pred, gt):
+    dot    = np.sum(pred * gt, axis=2)
+    norm_p = np.linalg.norm(pred, axis=2).clip(min=1e-8)
+    norm_g = np.linalg.norm(gt,   axis=2).clip(min=1e-8)
+    cos    = np.clip(dot / (norm_p * norm_g), -1.0, 1.0)
+    return float(np.mean(np.arccos(cos)) * 180.0 / np.pi)
+
+
+def save_comparison(rgb, pred, gt, idx, out_dir: Path, wl=None):
+    if wl is None:
+        wl = np.linspace(402, 1005, pred.shape[0])  # pred: (C,H,W)
 
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     axes[0].imshow(rgb.transpose(1, 2, 0))
@@ -113,8 +122,12 @@ def parse_args():
     p.add_argument('--ckpt',     type=str, default=str(CKPT_PATH))
     p.add_argument('--out_dir',  type=str, default=None,
                    help='Directory to save results and visualizations (default: project root)')
-    p.add_argument('--n_feat',   type=int, default=31)
-    p.add_argument('--stage',    type=int, default=3)
+    p.add_argument('--model',    type=str, default=None,
+                   help='Model architecture (overrides checkpoint; default: read from ckpt)')
+    p.add_argument('--n_feat',   type=int, default=None,
+                   help='Override n_feat (default: read from ckpt)')
+    p.add_argument('--stage',    type=int, default=None,
+                   help='Override stage (default: read from ckpt)')
     p.add_argument('--save_vis', action='store_true',
                    help='Save false-color comparison images')
     p.add_argument('--vis_n',    type=int, default=10,
@@ -137,9 +150,29 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
-    model = MSTpp(in_channels=3, out_channels=HSI_BANDS,
-                  n_feat=args.n_feat, stage=args.stage).to(device)
-    ckpt  = torch.load(str(ckpt_path), map_location=device)
+    ckpt = torch.load(str(ckpt_path), map_location=device)
+
+    # read training metadata from checkpoint (with CLI overrides)
+    if isinstance(ckpt, dict):
+        band_start  = ckpt.get('band_start', 0)
+        band_end    = ckpt.get('band_end',   176)
+        model_name  = args.model  or ckpt.get('model_name', 'mstpp')
+        n_feat      = args.n_feat or ckpt.get('n_feat', 31)
+        stage       = args.stage  or ckpt.get('stage',  3)
+    else:
+        band_start, band_end = 0, 176
+        model_name = args.model or 'mstpp'
+        n_feat     = args.n_feat or 31
+        stage      = args.stage  or 3
+    band_indices = list(range(band_start, band_end))
+    hsi_bands    = len(band_indices)
+    wl = WL_ALL[band_indices]
+    print(f'Model: {model_name}  n_feat={n_feat}  stage={stage}')
+    print(f'Band range: band {band_start}–{band_end-1} '
+          f'({wl[0]:.1f}–{wl[-1]:.1f} nm), {hsi_bands} bands')
+
+    model = build_model(model_name, in_channels=3, out_channels=hsi_bands,
+                        n_feat=n_feat, stage=stage).to(device)
     if isinstance(ckpt, dict) and 'model' in ckpt:
         model.load_state_dict(ckpt['model'])
         print(f'Loaded checkpoint from epoch {ckpt.get("epoch", "?")}')
@@ -148,7 +181,8 @@ def main():
         print('Loaded checkpoint (raw state_dict)')
     model.eval()
 
-    test_ds = BlueberryHSIDataset(PATCH_DIR / 'test', augment=False)
+    test_ds = BlueberryHSIDataset(PATCH_DIR / 'test', augment=False,
+                                  band_indices=band_indices)
     print(f'Test patches: {len(test_ds)}')
 
     if args.save_vis:
@@ -167,16 +201,18 @@ def main():
             r = rmse(pred_np, gt_np)
             p = psnr(pred_np, gt_np)
             s = mean_ssim(pred_np, gt_np)
-            results.append((m, r, p, s))
+            a = sam(pred_np, gt_np)
+            results.append((m, r, p, s, a))
 
             if args.save_vis and i < args.vis_n:
                 save_comparison(rgb.numpy(), pred.cpu().numpy(),
-                                hsi.numpy(), i, vis_dir)
+                                hsi.numpy(), i, vis_dir, wl=wl)
 
     mrae_arr = np.array([x[0] for x in results])
     rmse_arr = np.array([x[1] for x in results])
     psnr_arr = np.array([x[2] for x in results])
     ssim_arr = np.array([x[3] for x in results])
+    sam_arr  = np.array([x[4] for x in results])
 
     print('\n' + '='*55)
     print(f'{"Metric":<12} {"Mean":>10} {"Std":>10} {"Best":>10}')
@@ -185,11 +221,12 @@ def main():
     print(f'{"RMSE":<12} {rmse_arr.mean():>10.4f} {rmse_arr.std():>10.4f} {rmse_arr.min():>10.4f}')
     print(f'{"PSNR (dB)":<12} {psnr_arr.mean():>10.2f} {psnr_arr.std():>10.2f} {psnr_arr.max():>10.2f}')
     print(f'{"SSIM":<12} {ssim_arr.mean():>10.4f} {ssim_arr.std():>10.4f} {ssim_arr.max():>10.4f}')
+    print(f'{"SAM (°)":<12} {sam_arr.mean():>10.4f} {sam_arr.std():>10.4f} {sam_arr.min():>10.4f}')
     print('='*55)
 
     # save results
     np.savez(str(res_path), mrae=mrae_arr, rmse=rmse_arr,
-             psnr=psnr_arr, ssim=ssim_arr)
+             psnr=psnr_arr, ssim=ssim_arr, sam=sam_arr)
     print(f'\nDetailed results saved to {res_path}')
     if args.save_vis:
         print(f'Visualizations saved to {vis_dir}')

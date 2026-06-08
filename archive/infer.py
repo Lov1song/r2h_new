@@ -17,7 +17,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from architecture.MSTpp import MSTpp
 
 CKPT_PATH = Path(r'E:\2026\05\r2h\checkpoints\best.pth')

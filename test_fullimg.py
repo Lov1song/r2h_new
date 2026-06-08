@@ -3,7 +3,7 @@
 
 对 dataset/split.json 中的 test 样本：
   - 从 data/{name}.npz 读取完整配准 RGB + HSI + valid_mask
-  - 用最佳 v2 checkpoint 推理全图
+  - 用最佳 v6 checkpoint 推理全图
   - 裁剪至培养皿有效区域（valid_mask bounding box）
   - 在培养皿内用 Otsu 分割菌落（colony_mask）
   - 生成 5 列对比图：RGB菌落overlay / 预测假彩色 / GT假彩色 / 菌落掩码 / 光谱曲线
@@ -11,7 +11,7 @@
 
 Usage:
     python test_fullimg.py
-    python test_fullimg.py --ckpt checkpoints/v2/best.pth
+    python test_fullimg.py --ckpt checkpoints/v6/best.pth
 """
 
 import argparse
@@ -27,18 +27,18 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 sys.path.insert(0, str(Path(__file__).parent))
-from architecture.MSTpp import MSTpp
+from architecture import build_model
 
 # ── 路径 ──────────────────────────────────────────────────────────────────────
 ROOT       = Path(r'E:\2026\05\r2h')
 DATA_DIR   = ROOT / 'data'
 SPLIT_JSON = ROOT / 'dataset' / 'split.json'
-CKPT_PATH  = ROOT / 'checkpoints' / 'v2' / 'best.pth'
-OUT_DIR    = ROOT / 'checkpoints' / 'v3'
+CKPT_PATH  = ROOT / 'checkpoints' / 'v6' / 'best.pth'
+OUT_DIR    = ROOT / 'checkpoints' / 'v6'
 
-HSI_BANDS  = 176
 EPS        = 1e-3
-WL_NM      = np.linspace(402.6, 1005.5, 176)
+WL_ALL     = np.linspace(402, 1005, 176)
+WL_NM      = WL_ALL  # updated in main() after reading band_start/end from ckpt
 
 # ── 评价指标 ──────────────────────────────────────────────────────────────────
 
@@ -93,9 +93,7 @@ def false_color(hsi_hwc, mask=None):
     ], axis=2)
     if mask is not None:
         fc[~mask] = 0.0
-    lo = fc[mask].min() if mask is not None else fc.min()
-    hi = fc[mask].max() if mask is not None else fc.max()
-    return np.clip((fc - lo) / (hi - lo + 1e-8), 0, 1)
+    return np.clip(fc, 0.0, 1.0)
 
 def crop_to_mask(arr_hwc, mask):
     rows, cols = np.where(mask)
@@ -104,11 +102,7 @@ def crop_to_mask(arr_hwc, mask):
     return arr_hwc[r0:r1, c0:c1], mask[r0:r1, c0:c1]
 
 def make_rgb_display(rgb_u8, mask):
-    rgb = rgb_u8.astype(np.float32)
-    rgb[~mask] = 0.0
-    lo = np.percentile(rgb[mask], 2)
-    hi = np.percentile(rgb[mask], 98)
-    rgb = np.clip((rgb - lo) / (hi - lo + 1e-8), 0, 1)
+    rgb = rgb_u8.astype(np.float32) / 255.0
     rgb[~mask] = 0.0
     return rgb
 
@@ -184,16 +178,10 @@ def save_vis(name, rgb_disp, pred_fc, gt_fc, pred_hwc, gt_hwc,
 
     gs = gridspec.GridSpec(1, 5, figure=fig, wspace=0.06)
 
-    # 0: RGB + 菌落 overlay（绿色高亮菌落区域）
+    # 0: RGB（原图，无 overlay）
     ax = fig.add_subplot(gs[0, 0])
-    rgb_ov = rgb_disp.copy()
-    if colony_mask.any():
-        rgb_ov[colony_mask] = np.clip(
-            rgb_disp[colony_mask] * 0.6 + np.array([0.0, 0.4, 0.0]), 0, 1)
-    ax.imshow(rgb_ov)
-    n_col_pct = 100 * colony_mask.sum() / max(mask.sum(), 1)
-    ax.set_title(f'Input RGB (colony overlay)\n菌落占 {n_col_pct:.1f}%',
-                 color='#4FC3F7', fontsize=9, pad=3)
+    ax.imshow(rgb_disp)
+    ax.set_title('Input RGB', color='#4FC3F7', fontsize=9, pad=3)
     ax.axis('off')
     ax.set_facecolor(ax_bg)
 
@@ -221,7 +209,8 @@ def save_vis(name, rgb_disp, pred_fc, gt_fc, pred_hwc, gt_hwc,
     mask_vis[mask]        = [0.25, 0.25, 0.25]   # 培养基 → 灰
     mask_vis[colony_mask] = [0.10, 0.75, 0.20]   # 菌落   → 绿
     ax.imshow(mask_vis)
-    ax.set_title('Colony mask\n(green=colony  gray=agar)',
+    n_col_pct = 100 * colony_mask.sum() / max(mask.sum(), 1)
+    ax.set_title(f'Colony mask  ({n_col_pct:.1f}%)\n(green=colony  gray=agar)',
                  color='#B0BEC5', fontsize=9, pad=3)
     ax.axis('off')
     ax.set_facecolor(ax_bg)
@@ -264,26 +253,47 @@ def save_vis(name, rgb_disp, pred_fc, gt_fc, pred_hwc, gt_hwc,
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt',    default=str(CKPT_PATH))
-    p.add_argument('--n_feat',  type=int, default=31)
-    p.add_argument('--stage',   type=int, default=3)
+    p.add_argument('--model',   type=str, default=None,
+                   help='Model architecture (overrides checkpoint; default: read from ckpt)')
+    p.add_argument('--n_feat',  type=int, default=None,
+                   help='Override n_feat (default: read from ckpt)')
+    p.add_argument('--stage',   type=int, default=None,
+                   help='Override stage (default: read from ckpt)')
     p.add_argument('--split',   default='test',
                    help='Which split to evaluate: test | val | all')
+    p.add_argument('--out_dir', type=str, default=None,
+                   help='Output directory (default: same as ckpt folder)')
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     ckpt_path = Path(args.ckpt)
+    out_dir   = Path(args.out_dir) if args.out_dir else ckpt_path.parent
 
-    vis_dir = OUT_DIR / 'vis_fullimg'
+    vis_dir = out_dir / 'vis_fullimg'
     vis_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
-    model = MSTpp(in_channels=3, out_channels=HSI_BANDS,
-                  n_feat=args.n_feat, stage=args.stage).to(device)
+    # load checkpoint first to read training metadata
     ckpt = torch.load(str(ckpt_path), map_location=device)
+    band_start = ckpt.get('band_start', 0)
+    band_end   = ckpt.get('band_end',   176)
+    model_name = args.model  or ckpt.get('model_name', 'mstpp')
+    n_feat     = args.n_feat if args.n_feat is not None else ckpt.get('n_feat', 31)
+    stage      = args.stage  or ckpt.get('stage',  3)
+    hsi_bands  = band_end - band_start
+
+    global WL_NM
+    WL_NM = WL_ALL[band_start:band_end]
+    print(f'Model: {model_name}  n_feat={n_feat}  stage={stage}')
+    print(f'Band range: band {band_start}–{band_end-1} '
+          f'({WL_NM[0]:.1f}–{WL_NM[-1]:.1f} nm), {hsi_bands} bands')
+
+    model = build_model(model_name, in_channels=3, out_channels=hsi_bands,
+                        n_feat=n_feat, stage=stage).to(device)
     model.load_state_dict(ckpt['model'])
     ep = ckpt.get('epoch', '?')
     print(f'Loaded checkpoint  epoch={ep}  from {ckpt_path}')
@@ -311,7 +321,7 @@ def main():
         print(f'  {name} ...', end=' ', flush=True)
         d = np.load(str(npz_path))
         rgb_u8    = d['rgb']
-        hsi_gt    = d['hsi']
+        hsi_gt    = d['hsi'][:, :, band_start:band_end]   # trim to trained bands
         mask_full = d['valid_mask']
 
         pred_full = infer_full(model, rgb_u8, device)
@@ -369,7 +379,7 @@ def main():
               f'{np.mean([m["sam"]  for m in all_metrics]):>8.2f}')
     print('='*60)
 
-    csv_path = OUT_DIR / 'test_fullimg_metrics.csv'
+    csv_path = out_dir / 'test_fullimg_metrics.csv'
     with open(csv_path, 'w') as f:
         f.write('name,mrae,rmse,psnr,ssim,sam\n')
         for m in all_metrics:
@@ -426,7 +436,7 @@ def main():
                 sp.set_edgecolor('#2A3B4C')
 
         plt.tight_layout()
-        agg_path = OUT_DIR / 'mean_reflectance_spectrum.png'
+        agg_path = out_dir / 'mean_reflectance_spectrum.png'
         plt.savefig(str(agg_path), dpi=150, bbox_inches='tight', facecolor='#0D1B2A')
         plt.close()
         print(f'聚合光谱曲线：{agg_path}')
